@@ -1,0 +1,18 @@
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# Local config
+.env
+.env.local
+
+# OS
+Thumbs.db

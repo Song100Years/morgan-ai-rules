@@ -12,13 +12,14 @@ Exit code: 0 on PASS, 1 on REJECT / NEEDS_HUMAN / input error.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import yaml
 
@@ -51,8 +52,25 @@ STATUS_ENUM = {"current", "draft", "superseded", "archived", "legacy"}
 REQUIRED_FRONTMATTER = ("status", "valid_from", "owner", "project_id")
 
 VACUOUS_NAMES = {"untitled", "new", "temp", "draft", "test"}
-NAME_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_\-\.]*\.md$")
+NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_][a-zA-Z0-9_\-\.]*\.md$")
 SUFFIX_VERSIONING = re.compile(r"_v\d+\.md$|\(\d+\)\.md$")
+
+CEREMONY_FILENAMES_EXACT = {
+    "RULES.md", "DESIGN.md", "_global.md", "_shared.md", "CLAUDE.md", "AGENTS.md",
+}
+ADR_NAME_PATTERN = re.compile(r"^ADR_.+\.md$")
+ROUTINE_WORKSPACE_PREFIXES = (
+    "projects/", "archive/", "audit_logs/", "00-Morgan/",
+    "decisions/concerns/", "decisions/verdicts/", "handoff/",
+)
+
+SEMANTIC_KEYWORDS = (
+    "以後", "必須", "全 session", "所有 session", "不得",
+    "always", "never", "from now", "rule:", "policy:",
+    "強制", "規定",
+)
+
+GLOBAL_MD_REL_PATH = ("claude_md", "_global.md")
 
 DATE_FIELDS = ("valid_from",)
 DATETIME_FIELDS = ("expires_at", "wip_since", "promoted_at", "generated_at")
@@ -346,14 +364,138 @@ def _registered_projects_msg() -> str:
 
 
 # ----------------------------------------------------------------------------
+# R16-R19 helpers (Phase 2c v2 — structural classification + 4 補洞)
+# ----------------------------------------------------------------------------
+
+def _normalize_bytes(data: bytes) -> bytes:
+    """Strip CR / CRLF so Windows-checked-out files match Linux-stored origin."""
+    return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+
+
+def _is_ceremony_filename(name: str) -> bool:
+    if name in CEREMONY_FILENAMES_EXACT:
+        return True
+    return bool(ADR_NAME_PATTERN.match(name))
+
+
+def _is_routine_workspace(path: str) -> bool:
+    return any(path.startswith(prefix) for prefix in ROUTINE_WORKSPACE_PREFIXES)
+
+
+def _is_ceremony_doc(fm: dict, path: str) -> bool:
+    """Per INTEGRATION_DECISION.md §2.2 four structural signals."""
+    if fm.get("risk") in ("contract", "semantic"):
+        return True
+    if fm.get("supersedes"):
+        return True
+    if fm.get("status") == "current":
+        name = Path(path).name
+        if _is_ceremony_filename(name):
+            return True
+    return False
+
+
+def _check_r16_semantic_keywords(content: str, fm: dict, path: str) -> Optional[str]:
+    """R16: routine docs leaking rule-language (high-recall, low-precision)."""
+    if _is_ceremony_doc(fm, path):
+        return None
+    matched = [kw for kw in SEMANTIC_KEYWORDS if kw in content]
+    if not matched:
+        return None
+    sample = matched[:3]
+    return (
+        f"routine 內容含規則語氣關鍵詞 {sample}; "
+        "建議移到 claude_md/_global.md 或標 status: current + 結構性檔名 "
+        "(RULES.md / DESIGN.md / _global.md / _shared.md / ADR_*.md / CLAUDE.md / AGENTS.md)"
+    )
+
+
+def _default_r17_fingerprint_checker(req: dict) -> Optional[Tuple[str, str]]:
+    """R17: local claude_md/_global.md vs origin/main fingerprint.
+
+    Q3=B: use `git show origin/main:...` (no fetch). Normalize line endings
+    before hashing (per v2.2.3 patch). Skip gracefully when prerequisites
+    missing — fail-closed is delegated to the hook layer.
+    """
+    root = req.get("morgan_ai_rules_root")
+    if not root:
+        return None
+    root_path = Path(root)
+    local_md = root_path.joinpath(*GLOBAL_MD_REL_PATH)
+    if not local_md.exists():
+        return None
+    try:
+        local_data = _normalize_bytes(local_md.read_bytes())
+    except OSError:
+        return None
+    local_hash = hashlib.sha256(local_data).hexdigest()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root_path), "show",
+             f"origin/main:{'/'.join(GLOBAL_MD_REL_PATH)}"],
+            capture_output=True, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    remote_hash = hashlib.sha256(_normalize_bytes(result.stdout)).hexdigest()
+    if local_hash == remote_hash:
+        return None
+    msg = (
+        f"local _global.md sha256={local_hash[:12]} differs from "
+        f"origin/main sha256={remote_hash[:12]}; "
+        "run `git -C morgan-ai-rules pull` or resolve OneDrive conflict copy before continuing"
+    )
+    return (msg, "R17")
+
+
+def _check_r18_default_upgrade(fm: dict, path: str) -> Optional[str]:
+    """R18: status: current + non-whitelist filename outside routine workspace -> NEEDS_HUMAN.
+
+    Self-determination: filter to non-routine workspace paths to keep
+    false positives bounded while preserving the spec's high-recall intent
+    for legitimate ceremony locations (claude_md/, decisions/ADR_*, repo root).
+    """
+    if fm.get("status") != "current":
+        return None
+    if _is_routine_workspace(path):
+        return None
+    name = Path(path).name
+    if _is_ceremony_filename(name):
+        return None
+    return (
+        f"檔名 '{name}' 不在 ceremony 白名單但帶 status: current + 路徑非 routine workspace; "
+        "視為潛在 ceremony, 需 Morgan 確認或將檔名加入白名單"
+    )
+
+
+def _check_r19_status_upgrade(req: dict, fm: dict) -> Optional[str]:
+    """R19: draft -> current promotion needs Morgan in loop."""
+    op = req.get("operation")
+    prev = req.get("previous_frontmatter")
+    if op == "update" and isinstance(prev, dict):
+        if prev.get("status") == "draft" and fm.get("status") == "current":
+            return "draft → current 升級為 ceremony 級狀態轉換, 需 Morgan in loop"
+    return None
+
+
+# ----------------------------------------------------------------------------
 # Public API
 # ----------------------------------------------------------------------------
 
 def lint(req: dict, *, now: Optional[datetime] = None,
-         adr_mutex_checker=_adr_mutex_check) -> dict:
-    """Run rules R1-R15 in order. First failure short-circuits.
+         adr_mutex_checker=_adr_mutex_check,
+         r17_fingerprint_checker=_default_r17_fingerprint_checker) -> dict:
+    """Run rules R1-R19 in order. First failure short-circuits.
 
-    R12 returns flags (not fail).
+    Phase 2c v2 additions:
+      R16 — routine docs containing rule-language keywords -> NEEDS_HUMAN
+      R17 — local _global.md vs origin/main fingerprint -> REJECT (cross-machine drift)
+      R18 — status: current + non-whitelist filename in ceremony locations -> NEEDS_HUMAN
+      R19 — draft -> current promotion -> NEEDS_HUMAN
+
+    R12 still returns a flag (preserved); R19 is the hard gate.
     R10 returns NEEDS_HUMAN on conflict; degrades to flag if gh unavailable.
     """
     role = req.get("writer_role")
@@ -364,6 +506,15 @@ def lint(req: dict, *, now: Optional[datetime] = None,
     branch = req.get("branch", "") or ""
     vault_files = req.get("vault_files")
     previous_frontmatter = req.get("previous_frontmatter")
+
+    # R17 early: drift check runs before everything else. If the local rule
+    # source diverges from origin/main, downstream checks are based on stale
+    # rules and unsafe to trust. Skip gracefully when wrapper does not pass
+    # morgan_ai_rules_root (e.g. unit tests that mock).
+    r17_result = r17_fingerprint_checker(req)
+    if r17_result is not None:
+        msg, rule = r17_result
+        return _reject("CROSS_MACHINE_DRIFT_DETECTED", msg, rule)
 
     if role not in VALID_WRITER_ROLES:
         return _reject(
@@ -505,6 +656,21 @@ def lint(req: dict, *, now: Optional[datetime] = None,
     if pid not in VALID_PROJECT_IDS:
         return _reject("PROJECT_ID_NOT_FOUND", _registered_projects_msg(), "R15")
 
+    # R16 — semantic keyword flag (routine docs leaking rule-language)
+    r16_msg = _check_r16_semantic_keywords(content, fm, path)
+    if r16_msg:
+        return _needs_human("SEMANTIC_KEYWORD_FLAGGED", r16_msg, "R16")
+
+    # R18 — default upgrade fallback (unknown filename + status: current in ceremony location)
+    r18_msg = _check_r18_default_upgrade(fm, path)
+    if r18_msg:
+        return _needs_human("DEFAULT_UPGRADE_FALLBACK", r18_msg, "R18")
+
+    # R19 — status upgrade gate (draft -> current)
+    r19_msg = _check_r19_status_upgrade(req, fm)
+    if r19_msg:
+        return _needs_human("STATUS_UPGRADE_NEEDS_HUMAN", r19_msg, "R19")
+
     return _pass(flags=flags)
 
 
@@ -542,4 +708,10 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    # Force UTF-8 stdin/stdout regardless of host locale. Windows cp950 default
+    # mangles Chinese suggested_fix / human_summary_zh fields otherwise.
+    if hasattr(sys.stdin, "reconfigure"):
+        sys.stdin.reconfigure(encoding="utf-8")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     sys.exit(main())

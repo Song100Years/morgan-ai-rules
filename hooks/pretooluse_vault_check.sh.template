@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# pretooluse_vault_check.sh - Phase 2c v2 PreToolUse vault write gate
+#
+# Installed at: ~/.claude/hooks/pretooluse_vault_check.sh
+# Trigger     : Claude Code PreToolUse for Write|Edit
+# Args        : $1 = tool_name (e.g. "Write" or "Edit")
+#               $2 = tool_input (JSON string with file_path / content / etc.)
+# Exit codes  : 0  = allow (out of scope, or schema_lint PASS)
+#               2  = block (schema_lint REJECT or NEEDS_HUMAN — Claude Code halts)
+#               1  = internal error (fail-closed — also halts)
+#
+# Scope       : Writes whose file_path lives under a Vault OneDrive path
+#               (D|E:/OneDrive/VPS-Obsidian) or a morgan-ai-rules clone.
+# Performance : Designed to finish in < 2 s. Single python3 call does the work
+#               so we pay one cold start, not five.
+# Failure mode: fail-closed when schema_lint is locatable but errors out.
+#               Silently allow when schema_lint cannot be located at all (the
+#               installer's job is to wire MORGAN_AI_RULES_ROOT or auto-detect).
+
+set -uo pipefail
+
+TOOL_NAME="${1:-}"
+TOOL_INPUT="${2:-}"
+
+case "$TOOL_NAME" in
+  Write|Edit) ;;
+  *) exit 0 ;;
+esac
+[[ -z "$TOOL_INPUT" ]] && exit 0
+
+# Auto-detect morgan-ai-rules root. Installer can pre-set MORGAN_AI_RULES_ROOT
+# via env to skip the search.
+MORGAN_AI_RULES_ROOT="${MORGAN_AI_RULES_ROOT:-}"
+if [[ -z "$MORGAN_AI_RULES_ROOT" ]]; then
+  for cand in \
+    "/d/workspace/morgan-ai-rules" \
+    "/e/workspace/morgan-ai-rules" \
+    "/c/workspace/morgan-ai-rules" \
+    "$HOME/morgan-ai-rules" \
+    "$HOME/workspace/morgan-ai-rules"; do
+    if [[ -d "$cand/.git" ]]; then
+      MORGAN_AI_RULES_ROOT="$cand"
+      break
+    fi
+  done
+fi
+
+if [[ -z "$MORGAN_AI_RULES_ROOT" || ! -d "$MORGAN_AI_RULES_ROOT" ]]; then
+  exit 0
+fi
+SCHEMA_LINT="$MORGAN_AI_RULES_ROOT/scripts/schema_lint.py"
+[[ ! -r "$SCHEMA_LINT" ]] && exit 0
+
+export MORGAN_AI_RULES_ROOT
+
+python3 - "$TOOL_INPUT" "$MORGAN_AI_RULES_ROOT" "$SCHEMA_LINT" <<'PY'
+import json, os, sys, subprocess, pathlib
+
+tool_input_raw, root, schema_lint_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+try:
+    tool_input = json.loads(tool_input_raw)
+except Exception:
+    sys.exit(0)
+
+file_path = tool_input.get("file_path", "") or ""
+if not file_path:
+    sys.exit(0)
+
+fp_norm = file_path.replace("\\", "/").lower()
+root_norm = root.replace("\\", "/").lower()
+
+# In-scope determination:
+#   1. file_path is under MORGAN_AI_RULES_ROOT (authoritative)
+#   2. file_path contains "morgan-ai-rules/" (covers paths outside the
+#      resolved root, e.g. another clone)
+#   3. file_path is under a Vault OneDrive path
+under_root = fp_norm.startswith(root_norm + "/") or fp_norm == root_norm
+under_other_clone = "morgan-ai-rules/" in fp_norm
+under_vault = "onedrive" in fp_norm and "vps-obsidian" in fp_norm
+if not (under_root or under_other_clone or under_vault):
+    sys.exit(0)
+
+target_rel = file_path.replace("\\", "/")
+if target_rel.lower().startswith(root_norm + "/"):
+    target_rel = target_rel[len(root_norm) + 1:]
+else:
+    for vault_root in (
+        "d:/onedrive/vps-obsidian/",
+        "e:/onedrive/vps-obsidian/",
+        "/d/onedrive/vps-obsidian/",
+        "/e/onedrive/vps-obsidian/",
+    ):
+        if target_rel.lower().startswith(vault_root):
+            target_rel = target_rel[len(vault_root):]
+            break
+
+op = "update" if pathlib.Path(file_path).exists() else "create"
+
+content = tool_input.get("content") or ""
+if not content:
+    new_str = tool_input.get("new_string", "")
+    old_str = tool_input.get("old_string", "")
+    if new_str:
+        try:
+            existing = pathlib.Path(file_path).read_text(encoding="utf-8")
+            if old_str and old_str in existing:
+                content = existing.replace(old_str, new_str, 1)
+            else:
+                content = existing if existing else new_str
+        except OSError:
+            content = new_str
+    else:
+        try:
+            content = pathlib.Path(file_path).read_text(encoding="utf-8")
+        except OSError:
+            content = ""
+
+req = {
+    "writer_role": "executor",
+    "writer_engine": "claude",
+    "target_path": target_rel,
+    "operation": op,
+    "content": content,
+    "branch": "main",
+    "morgan_ai_rules_root": root,
+}
+
+try:
+    sub_env = os.environ.copy()
+    sub_env["PYTHONIOENCODING"] = "utf-8"
+    result = subprocess.run(
+        [sys.executable, schema_lint_path],
+        input=json.dumps(req, ensure_ascii=False),
+        capture_output=True, text=True, timeout=10,
+        encoding="utf-8",
+        env=sub_env,
+    )
+except subprocess.TimeoutExpired:
+    print("[VAULT-CHECK] schema_lint timeout (>10s) — fail-closed", file=sys.stderr)
+    sys.exit(2)
+except Exception as exc:
+    print(f"[VAULT-CHECK] schema_lint invocation error: {exc}", file=sys.stderr)
+    sys.exit(2)
+
+try:
+    verdict_obj = json.loads(result.stdout)
+except Exception:
+    print(f"[VAULT-CHECK] schema_lint output unparseable: {result.stdout[:200]}", file=sys.stderr)
+    sys.exit(2)
+
+verdict = verdict_obj.get("verdict", "")
+rule = verdict_obj.get("fail_at_rule", "")
+fix = verdict_obj.get("suggested_fix") or verdict_obj.get("human_summary_zh", "")
+
+if verdict == "PASS":
+    sys.exit(0)
+if verdict == "REJECT":
+    print(f"[VAULT-CHECK] REJECT ({rule}): {fix}", file=sys.stderr)
+    sys.exit(2)
+if verdict == "NEEDS_HUMAN":
+    print(f"[VAULT-CHECK] 需 Morgan in loop ({rule}): {fix}", file=sys.stderr)
+    print("這次寫入屬於 ceremony 級操作，請先跟 Morgan 對齊後再執行。", file=sys.stderr)
+    sys.exit(2)
+print(f"[VAULT-CHECK] unknown verdict: {verdict}", file=sys.stderr)
+sys.exit(2)
+PY

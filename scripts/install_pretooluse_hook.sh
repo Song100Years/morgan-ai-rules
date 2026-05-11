@@ -28,6 +28,35 @@ done
 [[ -r "$TEMPLATE" ]] || { echo "ERROR: template not found: $TEMPLATE" >&2; exit 1; }
 [[ -r "$REPO_ROOT/scripts/schema_lint.py" ]] || { echo "ERROR: schema_lint.py not found in repo: $REPO_ROOT/scripts/" >&2; exit 1; }
 
+# schema_lint imports yaml; without it the hook silently fails because
+# schema_lint crashes on import before producing any verdict JSON.
+# Auto-install via pip --user (no sudo). Set INSTALL_HOOK_SKIP_PYYAML=1 to
+# bypass (e.g. when the host uses a system-managed PyYAML package).
+if [[ "${INSTALL_HOOK_SKIP_PYYAML:-0}" != "1" ]]; then
+    if ! python3 -c "import yaml" >/dev/null 2>&1; then
+        echo "[install] PyYAML missing; schema_lint cannot parse frontmatter without it."
+        echo "[install] running: python3 -m pip install --user --quiet pyyaml"
+        if python3 -m pip install --user --quiet pyyaml; then
+            if python3 -c "import yaml" >/dev/null 2>&1; then
+                yaml_ver=$(python3 -c "import yaml; print(yaml.__version__)" 2>/dev/null)
+                echo "[install] PyYAML ${yaml_ver} installed."
+            else
+                echo "ERROR: pip reported success but yaml still un-importable; check python paths" >&2
+                exit 1
+            fi
+        else
+            echo "ERROR: pyyaml auto-install failed. Run manually then re-run installer:" >&2
+            echo "  python3 -m pip install --user pyyaml" >&2
+            echo "On distros that block pip user-installs (PEP 668), use the system package:" >&2
+            echo "  sudo apt install python3-yaml   # Debian / Ubuntu" >&2
+            exit 1
+        fi
+    else
+        yaml_ver=$(python3 -c "import yaml; print(yaml.__version__)" 2>/dev/null)
+        echo "[install] PyYAML ${yaml_ver} present."
+    fi
+fi
+
 mkdir -p "$HOOK_DIR"
 cp "$TEMPLATE" "$HOOK_DEST"
 chmod +x "$HOOK_DEST"

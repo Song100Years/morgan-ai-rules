@@ -557,12 +557,16 @@ class TestR12PromoteFlag:
         assert result["verdict"] == "PASS"
         assert "PROMOTE_DRAFT_STRICT_GUARDIAN" not in result["flags"]
 
-    def test_promote_draft_to_current_sets_flag(self, valid_request):
+    def test_promote_draft_to_current_now_blocked_by_r19(self, valid_request):
+        # Phase 2c v2: R12 soft flag is superseded by R19 hard gate.
+        # The flag is still computed internally (preserved for future flexibility)
+        # but R19 short-circuits before it surfaces in the public verdict.
         valid_request["operation"] = "update"
         valid_request["previous_frontmatter"] = {"status": "draft"}
         result = sl.lint(valid_request)
-        assert result["verdict"] == "PASS"
-        assert "PROMOTE_DRAFT_STRICT_GUARDIAN" in result["flags"]
+        assert result["verdict"] == "NEEDS_HUMAN"
+        assert result["fail_at_rule"] == "R19"
+        assert result["error_code"] == "STATUS_UPGRADE_NEEDS_HUMAN"
 
     def test_current_to_current_no_flag(self, valid_request):
         valid_request["operation"] = "update"
@@ -865,3 +869,277 @@ class TestParseUtcIsoHelper:
     def test_garbage_rejected(self):
         with pytest.raises(ValueError):
             sl.parse_utc_iso("not a date")
+
+
+# ============================================================================
+# Phase 2c v2 — R16-R19 structural classification + 4 補洞
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# R6 — leading underscore allowed for ceremony filenames (Phase 2c v2 update)
+# ----------------------------------------------------------------------------
+
+class TestR6LeadingUnderscore:
+    """NAME_PATTERN expanded to accept leading `_` so ceremony files
+    (_global.md, _shared.md) can pass R6. Required for R18 whitelist coherence."""
+
+    def test_global_md_name_passes_r6(self, valid_request):
+        # Use human_only role to bypass R1 path restriction on claude_md/
+        valid_request["writer_role"] = "human_only"
+        valid_request["target_path"] = "claude_md/_global.md"
+        result = sl.lint(valid_request)
+        # R18 may fire (status: current + ceremony file is allowed via whitelist),
+        # so the verdict should be PASS — _is_ceremony_filename matches _global.md.
+        assert result["verdict"] == "PASS"
+
+    def test_shared_md_name_passes_r6(self, valid_request):
+        valid_request["writer_role"] = "human_only"
+        valid_request["target_path"] = "claude_md/_shared.md"
+        result = sl.lint(valid_request)
+        assert result["verdict"] == "PASS"
+
+    def test_double_underscore_still_passes_naming(self, valid_request):
+        # NAME_PATTERN allows leading `_`; subsequent chars still constrained.
+        valid_request["writer_role"] = "human_only"
+        valid_request["target_path"] = "projects/pattern_trader/_notes.md"
+        result = sl.lint(valid_request)
+        assert result["verdict"] == "PASS"
+
+
+# ----------------------------------------------------------------------------
+# R16 — Semantic keyword flag (routine docs leaking rule-language)
+# ----------------------------------------------------------------------------
+
+class TestR16SemanticKeywords:
+    def test_routine_without_keywords_passes(self, valid_frontmatter_lines, make_content):
+        req = {
+            "writer_role": "executor",
+            "writer_engine": "claude",
+            "target_path": "projects/pattern_trader/notes/slice_03.md",
+            "operation": "create",
+            "content": make_content(valid_frontmatter_lines, body="# Slice 03\n\nDay-to-day notes.\n"),
+            "branch": "main",
+        }
+        result = sl.lint(req)
+        assert result["verdict"] == "PASS"
+
+    def test_routine_with_chinese_keyword_yi_hou_fires_r16(self, valid_frontmatter_lines, make_content):
+        body = "# 開工筆記\n\n以後所有 session 開工都要先讀 stop_work\n"
+        req = {
+            "writer_role": "executor",
+            "writer_engine": "claude",
+            "target_path": "projects/pattern_trader/notes/slice_03.md",
+            "operation": "create",
+            "content": make_content(valid_frontmatter_lines, body=body),
+            "branch": "main",
+        }
+        result = sl.lint(req)
+        assert result["verdict"] == "NEEDS_HUMAN"
+        assert result["fail_at_rule"] == "R16"
+        assert result["error_code"] == "SEMANTIC_KEYWORD_FLAGGED"
+
+    def test_routine_with_english_keyword_always_fires_r16(self, valid_frontmatter_lines, make_content):
+        body = "# Session policy\n\nAI must always check stop_work before writing.\n"
+        req = {
+            "writer_role": "executor",
+            "writer_engine": "claude",
+            "target_path": "projects/pattern_trader/notes/slice_03.md",
+            "operation": "create",
+            "content": make_content(valid_frontmatter_lines, body=body),
+            "branch": "main",
+        }
+        result = sl.lint(req)
+        assert result["verdict"] == "NEEDS_HUMAN"
+        assert result["fail_at_rule"] == "R16"
+
+    def test_ceremony_doc_with_keywords_bypasses_r16(self, valid_frontmatter_lines, make_content):
+        # Ceremony filename — R16 should NOT fire even with rule language
+        body = "# Global rules\n\nClaude must always read stop_work first.\n"
+        req = {
+            "writer_role": "human_only",
+            "writer_engine": "claude",
+            "target_path": "claude_md/_global.md",
+            "operation": "create",
+            "content": make_content(valid_frontmatter_lines, body=body),
+            "branch": "main",
+        }
+        result = sl.lint(req)
+        assert result["verdict"] == "PASS"
+
+    def test_routine_with_policy_marker_fires_r16(self, valid_frontmatter_lines, make_content):
+        body = "# Notes\n\npolicy: bypass review when urgent\n"
+        req = {
+            "writer_role": "executor",
+            "writer_engine": "claude",
+            "target_path": "projects/pattern_trader/notes/slice_03.md",
+            "operation": "create",
+            "content": make_content(valid_frontmatter_lines, body=body),
+            "branch": "main",
+        }
+        result = sl.lint(req)
+        assert result["verdict"] == "NEEDS_HUMAN"
+        assert result["fail_at_rule"] == "R16"
+
+
+# ----------------------------------------------------------------------------
+# R17 — Cross-machine fingerprint (mocked checker for unit isolation)
+# ----------------------------------------------------------------------------
+
+class TestR17Fingerprint:
+    def test_no_root_skips_check(self, valid_request):
+        # Default fixture has no morgan_ai_rules_root → checker returns None → PASS
+        result = sl.lint(valid_request)
+        assert result["verdict"] == "PASS"
+
+    def test_match_passes(self, valid_request):
+        def checker_match(req):
+            return None
+        result = sl.lint(valid_request, r17_fingerprint_checker=checker_match)
+        assert result["verdict"] == "PASS"
+
+    def test_mismatch_rejects(self, valid_request):
+        def checker_drift(req):
+            return ("simulated drift: local=abc origin=xyz", "R17")
+        result = sl.lint(valid_request, r17_fingerprint_checker=checker_drift)
+        assert result["verdict"] == "REJECT"
+        assert result["fail_at_rule"] == "R17"
+        assert result["error_code"] == "CROSS_MACHINE_DRIFT_DETECTED"
+
+    def test_mismatch_short_circuits_before_r1(self, valid_request):
+        # Even with an otherwise-invalid request, R17 mismatch fires first.
+        valid_request["writer_role"] = "rogue_role_that_would_fail_r1"
+        def checker_drift(req):
+            return ("drift first", "R17")
+        result = sl.lint(valid_request, r17_fingerprint_checker=checker_drift)
+        assert result["fail_at_rule"] == "R17"
+
+    def test_normalize_bytes_strips_crlf(self):
+        assert sl._normalize_bytes(b"line1\r\nline2\r\n") == b"line1\nline2\n"
+        assert sl._normalize_bytes(b"line1\rline2\r") == b"line1\nline2\n"
+        assert sl._normalize_bytes(b"line1\nline2\n") == b"line1\nline2\n"
+
+
+# ----------------------------------------------------------------------------
+# R18 — Default upgrade fallback (current + non-whitelist filename)
+# ----------------------------------------------------------------------------
+
+class TestR18DefaultUpgrade:
+    def test_whitelist_filename_in_ceremony_path_passes(self, valid_request):
+        valid_request["writer_role"] = "human_only"
+        valid_request["target_path"] = "claude_md/_global.md"
+        result = sl.lint(valid_request)
+        assert result["verdict"] == "PASS"
+
+    def test_adr_filename_passes_via_pattern(self, valid_request):
+        valid_request["writer_role"] = "executor"
+        valid_request["target_path"] = "decisions/ADR_2026-05-11_topic.md"
+        valid_request["operation"] = "create"
+        result = sl.lint(valid_request)
+        assert result["verdict"] == "PASS"
+
+    def test_routine_workspace_bypasses_r18(self, valid_request):
+        # status: current + projects/ path + unfamiliar name → routine workspace, no R18
+        valid_request["target_path"] = "projects/pattern_trader/some_uncommon_name.md"
+        result = sl.lint(valid_request)
+        assert result["verdict"] == "PASS"
+
+    def test_non_whitelist_in_ceremony_path_fires_r18(self, valid_request):
+        # human_only + ceremony-ish path + unknown filename → R18
+        valid_request["writer_role"] = "human_only"
+        valid_request["target_path"] = "claude_md/something_new.md"
+        result = sl.lint(valid_request)
+        assert result["verdict"] == "NEEDS_HUMAN"
+        assert result["fail_at_rule"] == "R18"
+        assert result["error_code"] == "DEFAULT_UPGRADE_FALLBACK"
+
+    def test_draft_status_does_not_fire_r18(self, valid_frontmatter_lines, make_content):
+        # status: draft + non-whitelist filename outside routine workspace → no R18
+        # (R18 only triggers on status: current)
+        draft_lines = [
+            "status: draft",
+            "valid_from: 2026-05-10",
+            "owner: morgan",
+            "project_id: ai_governance",
+            "expires_at: 2026-05-25T00:00:00Z",
+        ]
+        req = {
+            "writer_role": "human_only",
+            "writer_engine": "claude",
+            "target_path": "claude_md/draft_proposal.md",
+            "operation": "create",
+            "content": make_content(draft_lines),
+            "branch": "main",
+        }
+        result = sl.lint(req)
+        assert result["verdict"] == "PASS"
+
+
+# ----------------------------------------------------------------------------
+# R19 — Status upgrade gate (draft → current)
+# ----------------------------------------------------------------------------
+
+class TestR19StatusUpgrade:
+    def test_draft_to_current_blocked(self, valid_request):
+        valid_request["operation"] = "update"
+        valid_request["previous_frontmatter"] = {"status": "draft"}
+        result = sl.lint(valid_request)
+        assert result["verdict"] == "NEEDS_HUMAN"
+        assert result["fail_at_rule"] == "R19"
+        assert result["error_code"] == "STATUS_UPGRADE_NEEDS_HUMAN"
+
+    def test_current_to_current_passes(self, valid_request):
+        valid_request["operation"] = "update"
+        valid_request["previous_frontmatter"] = {"status": "current"}
+        result = sl.lint(valid_request)
+        assert result["verdict"] == "PASS"
+
+    def test_create_with_previous_draft_does_not_fire_r19(self, valid_request):
+        # R19 only triggers on update, not create
+        valid_request["operation"] = "create"
+        valid_request["previous_frontmatter"] = {"status": "draft"}
+        result = sl.lint(valid_request)
+        assert result["verdict"] == "PASS"
+
+    def test_no_previous_no_r19(self, valid_request):
+        result = sl.lint(valid_request)
+        assert result["verdict"] == "PASS"
+
+    def test_superseded_to_current_does_not_fire_r19(self, valid_request):
+        # Only draft → current trips R19 (rename/delete to be handled at hook layer)
+        valid_request["operation"] = "update"
+        valid_request["previous_frontmatter"] = {"status": "superseded"}
+        result = sl.lint(valid_request)
+        assert result["verdict"] == "PASS"
+
+
+# ----------------------------------------------------------------------------
+# Ceremony classification helpers (used by R16/R18)
+# ----------------------------------------------------------------------------
+
+class TestCeremonyHelpers:
+    def test_is_ceremony_filename_exact(self):
+        assert sl._is_ceremony_filename("RULES.md")
+        assert sl._is_ceremony_filename("DESIGN.md")
+        assert sl._is_ceremony_filename("_global.md")
+        assert sl._is_ceremony_filename("_shared.md")
+        assert sl._is_ceremony_filename("CLAUDE.md")
+        assert sl._is_ceremony_filename("AGENTS.md")
+
+    def test_is_ceremony_filename_adr_pattern(self):
+        assert sl._is_ceremony_filename("ADR_2026-05-11_topic.md")
+        assert sl._is_ceremony_filename("ADR_initial.md")
+
+    def test_is_ceremony_filename_negative(self):
+        assert not sl._is_ceremony_filename("notes.md")
+        assert not sl._is_ceremony_filename("slice_03.md")
+        assert not sl._is_ceremony_filename("stop_work_2026-05-11.md")
+
+    def test_is_routine_workspace(self):
+        assert sl._is_routine_workspace("projects/pattern_trader/x.md")
+        assert sl._is_routine_workspace("archive/old.md")
+        assert sl._is_routine_workspace("00-Morgan/notes.md")
+        assert sl._is_routine_workspace("decisions/concerns/c.md")
+        assert sl._is_routine_workspace("decisions/verdicts/v.md")
+        assert not sl._is_routine_workspace("claude_md/x.md")
+        assert not sl._is_routine_workspace("agents/guardian.md")
+        assert not sl._is_routine_workspace("decisions/ADR_x.md")

@@ -53,10 +53,57 @@ SCHEMA_LINT="$MORGAN_AI_RULES_ROOT/scripts/schema_lint.py"
 
 export MORGAN_AI_RULES_ROOT
 
-python3 - "$TOOL_INPUT" "$MORGAN_AI_RULES_ROOT" "$SCHEMA_LINT" <<'PY'
+python3 - "$TOOL_INPUT" "$MORGAN_AI_RULES_ROOT" "$SCHEMA_LINT" "$TOOL_NAME" <<'PY'
 import json, os, sys, subprocess, pathlib
+from datetime import datetime, timezone
 
-tool_input_raw, root, schema_lint_path = sys.argv[1], sys.argv[2], sys.argv[3]
+# Phase 5 — shadow mode metric collection.
+# VAULT_GOVERNANCE_MODE = "enforce" (default, backward compat) | "shadow"
+# In shadow mode, non-PASS verdicts log a JSONL row and exit 0; R17 (cross-
+# machine _global.md drift) is the永遠 enforce 後門 — its REJECT always halts
+# regardless of mode, because R17 is a write-time precondition (rule-source
+# freshness) rather than a rule content check.
+# Per Phase 5 補5 拍板 A (Morgan 2026-05-12).
+SCRIPT_VERSION = "phase5-v1"
+SHADOW_LOG_DEFAULT = os.path.expanduser("~/.claude/logs/vault_governance_shadow.jsonl")
+SHADOW_LOG_PATH = os.environ.get("VAULT_SHADOW_LOG_PATH", SHADOW_LOG_DEFAULT)
+SHADOW_LOG_SIZE_CAP_BYTES = 50 * 1024 * 1024  # 50MB cap; warning-only, rotation Phase 9.
+
+
+def _write_shadow_log(record: dict) -> bool:
+    """Append one JSONL line; return True on success, False on any failure.
+
+    Phase 5 紀律：caller fallback enforce (exit 2) on False (治理底線).
+    """
+    try:
+        log_path = pathlib.Path(SHADOW_LOG_PATH)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        with open(log_path, "a", encoding="utf-8", newline="") as f:
+            f.write(line)
+    except OSError as exc:
+        print(f"[VAULT-CHECK] shadow log write failed: {exc}", file=sys.stderr)
+        return False
+
+    # 50MB cap — warning-only, never blocks. Rotation Phase 9.
+    try:
+        size = log_path.stat().st_size
+        if size > SHADOW_LOG_SIZE_CAP_BYTES:
+            mb = size // (1024 * 1024)
+            print(
+                f"[VAULT-CHECK] shadow log size {mb}MB exceeds 50MB cap; "
+                f"manual rotate (mv {SHADOW_LOG_PATH} {SHADOW_LOG_PATH}.bak) "
+                f"or wait Phase 9 cron",
+                file=sys.stderr,
+            )
+    except OSError:
+        pass
+    return True
+
+
+tool_input_raw, root, schema_lint_path, tool_name = (
+    sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4],
+)
 
 try:
     tool_input = json.loads(tool_input_raw)
@@ -151,10 +198,49 @@ except Exception:
 
 verdict = verdict_obj.get("verdict", "")
 rule = verdict_obj.get("fail_at_rule", "")
+error_code = verdict_obj.get("error_code", "")
 fix = verdict_obj.get("suggested_fix") or verdict_obj.get("human_summary_zh", "")
 
+# PASS — short-circuit, identical in both modes.
 if verdict == "PASS":
     sys.exit(0)
+
+# Phase 5 — resolve mode. Unknown values fail-closed to enforce.
+mode = os.environ.get("VAULT_GOVERNANCE_MODE", "enforce").strip().lower()
+if mode not in ("enforce", "shadow"):
+    print(
+        f"[VAULT-CHECK] unknown VAULT_GOVERNANCE_MODE={mode!r}; fail-closed enforce",
+        file=sys.stderr,
+    )
+    mode = "enforce"
+
+# R17 永遠 enforce 後門 — cross-machine _global.md drift halts regardless of mode.
+# R17 is a write-time precondition (rule-source freshness), not a rule-content
+# judgement; observing lint outcomes on stale rules has no signal.
+is_r17_drift = (rule == "R17")
+
+if mode == "shadow" and not is_r17_drift:
+    record = {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "tool_name": tool_name,
+        "target_path": target_rel,
+        "verdict": verdict,
+        "fail_at_rule": rule,
+        "error_code": error_code,
+        "suggested_fix": fix,
+        "mode": "shadow",
+        "script_version": SCRIPT_VERSION,
+    }
+    if not _write_shadow_log(record):
+        # Log write failed → fallback enforce (治理底線).
+        print(
+            f"[VAULT-CHECK] shadow log write failed → fallback enforce ({rule}): {fix}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    sys.exit(0)
+
+# Enforce path (or R17 in any mode).
 if verdict == "REJECT":
     print(f"[VAULT-CHECK] REJECT ({rule}): {fix}", file=sys.stderr)
     sys.exit(2)

@@ -843,6 +843,53 @@ class TestCli:
         rc = sl.main(["--input-file", str(path)])
         assert rc == 1
 
+    def test_cli_exit_code_contract_phase5(self, tmp_path, valid_request, capsys):
+        """Phase 5 加碼 — verify CLI exit code contract + stdout payload shape.
+
+        Documents the schema_lint CLI contract (distinct from hook contract):
+          verdict PASS         -> exit 0, stdout: {"verdict": "PASS", ...}
+          verdict REJECT       -> exit 1, stdout: {"verdict": "REJECT", ...}
+          verdict NEEDS_HUMAN  -> exit 1, stdout: {"verdict": "NEEDS_HUMAN", ...}
+
+        The hook layer (pretooluse_vault_check.sh) wraps these into exit 0 / 2
+        for Claude Code semantics — that wrapping lives in dogfood tests.
+        """
+        # PASS
+        p1 = tmp_path / "pass.json"
+        p1.write_text(json.dumps(valid_request), encoding="utf-8")
+        rc = sl.main(["--input-file", str(p1)])
+        out1 = capsys.readouterr().out
+        assert rc == 0
+        assert json.loads(out1)["verdict"] == "PASS"
+
+        # REJECT (R1 path permission)
+        req2 = dict(valid_request)
+        req2["target_path"] = "00-Morgan/forbidden.md"
+        p2 = tmp_path / "reject.json"
+        p2.write_text(json.dumps(req2), encoding="utf-8")
+        rc = sl.main(["--input-file", str(p2)])
+        out2 = capsys.readouterr().out
+        assert rc == 1
+        payload2 = json.loads(out2)
+        assert payload2["verdict"] == "REJECT"
+        assert payload2["fail_at_rule"] == "R1"
+
+        # NEEDS_HUMAN (R16 semantic keyword in routine doc)
+        req3 = dict(valid_request)
+        req3["content"] = (
+            "---\nstatus: current\nvalid_from: 2026-05-12\nowner: morgan\n"
+            "project_id: pattern_trader\n---\n# notes\n\n"
+            "以後所有 session 必須先讀 stop_work 才能動工。\n"
+        )
+        p3 = tmp_path / "needs_human.json"
+        p3.write_text(json.dumps(req3), encoding="utf-8")
+        rc = sl.main(["--input-file", str(p3)])
+        out3 = capsys.readouterr().out
+        assert rc == 1
+        payload3 = json.loads(out3)
+        assert payload3["verdict"] == "NEEDS_HUMAN"
+        assert payload3["fail_at_rule"] == "R16"
+
 
 # ----------------------------------------------------------------------------
 # Helper sanity checks

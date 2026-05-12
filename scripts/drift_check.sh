@@ -28,6 +28,7 @@ GUARDIAN_REF_PATH="${GUARDIAN_REF_PATH:-$HOME/morgan-ai-rules/agents/guardian.md
 DRIFT_LOG_DIR="${DRIFT_LOG_DIR:-$HOME/morgan_ai_logs}"
 
 mkdir -p "$DRIFT_LOG_DIR"
+find "$DRIFT_LOG_DIR" -maxdepth 1 -name 'guardian_drift_*.log' -type f -mtime +90 -delete 2>/dev/null || true
 log_file="$DRIFT_LOG_DIR/guardian_drift_$(date -u +%F).log"
 ts=$(date -u +%FT%TZ)
 

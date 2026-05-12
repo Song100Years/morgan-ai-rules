@@ -29,7 +29,7 @@ import yaml
 
 WRITER_ROLE_PATHS = {
     "executor": {
-        "allow": ["projects/", "decisions/"],
+        "allow": ["projects/", "decisions/", "99-System/Runbook/", "99-system/Runbook/"],
         "deny": ["00-Morgan/", "archive/legacy_", "99-rules/", "agents/"],
     },
     "advisor": {
@@ -62,6 +62,7 @@ ADR_NAME_PATTERN = re.compile(r"^ADR_.+\.md$")
 ROUTINE_WORKSPACE_PREFIXES = (
     "projects/", "archive/", "audit_logs/", "00-Morgan/",
     "decisions/concerns/", "decisions/verdicts/", "handoff/",
+    "99-System/Runbook/", "99-system/Runbook/",
 )
 
 SEMANTIC_KEYWORDS = (

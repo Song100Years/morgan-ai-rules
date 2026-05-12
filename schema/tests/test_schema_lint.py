@@ -1043,6 +1043,12 @@ class TestR18DefaultUpgrade:
         result = sl.lint(valid_request)
         assert result["verdict"] == "PASS"
 
+    def test_runbook_path_bypasses_r18(self, valid_request):
+        # Phase 3: status: current Runbook is ops truth, classified routine not ceremony
+        valid_request["target_path"] = "99-System/Runbook/claw/000_QUICK_STATUS.md"
+        result = sl.lint(valid_request)
+        assert result["verdict"] == "PASS"
+
     def test_non_whitelist_in_ceremony_path_fires_r18(self, valid_request):
         # human_only + ceremony-ish path + unknown filename → R18
         valid_request["writer_role"] = "human_only"
@@ -1140,6 +1146,9 @@ class TestCeremonyHelpers:
         assert sl._is_routine_workspace("00-Morgan/notes.md")
         assert sl._is_routine_workspace("decisions/concerns/c.md")
         assert sl._is_routine_workspace("decisions/verdicts/v.md")
+        assert sl._is_routine_workspace("99-System/Runbook/claw/000_QUICK_STATUS.md")
+        assert sl._is_routine_workspace("99-system/Runbook/claw/01_SYSTEM_STATE.md")
         assert not sl._is_routine_workspace("claude_md/x.md")
         assert not sl._is_routine_workspace("agents/guardian.md")
         assert not sl._is_routine_workspace("decisions/ADR_x.md")
+        assert not sl._is_routine_workspace("99-System/AI_Governance/DESIGN.md")

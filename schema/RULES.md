@@ -325,7 +325,9 @@ if fm["status"] == "current" \
     return NEEDS_HUMAN("DEFAULT_UPGRADE_FALLBACK")
 ```
 
-**ROUTINE_WORKSPACE_PREFIXES**：`projects/ | archive/ | audit_logs/ | 00-Morgan/ | decisions/concerns/ | decisions/verdicts/ | handoff/`
+**ROUTINE_WORKSPACE_PREFIXES**：`projects/ | archive/ | audit_logs/ | 00-Morgan/ | decisions/concerns/ | decisions/verdicts/ | handoff/ | 99-System/Runbook/ | 99-system/Runbook/`
+
+> Phase 3 補洞（2026-05-12）：加入 `99-System/Runbook/` 雙 case 變體 — Vault VPS 維運 Runbook 是 ops 真相、不是規則 SOT，屬 routine 性質；加雙 case 防 Windows 大小寫漂移漏接。
 
 **自決邊界**（Phase 2c v2 動工拍板）：R18 只 fire 在「**非** routine workspace 路徑」。原 spec 廣譜「凡 `status: current` + 非白名單檔名 → NEEDS_HUMAN」會誤擾所有 routine 寫入（`projects/pattern_trader/sdd_slice_03.md` 等都是 current 但屬 routine workspace）。位置 + 檔名 雙重訊號才升 NEEDS_HUMAN，符合「結構訊號」精神且大幅降低 false positive。
 

@@ -62,7 +62,11 @@ ADR_NAME_PATTERN = re.compile(r"^ADR_.+\.md$")
 ROUTINE_WORKSPACE_PREFIXES = (
     "projects/", "archive/", "audit_logs/", "00-Morgan/",
     "decisions/concerns/", "decisions/verdicts/", "handoff/",
+    # Phase 3 — Vault Runbook (dual case for OneDrive cross-machine drift)
     "99-System/Runbook/", "99-system/Runbook/",
+    # Phase 4 — passive scan inbox + quarterly audit output
+    "99-System/AI_Governance/INBOX/", "99-system/AI_Governance/INBOX/",
+    "99-System/AI_Governance/QUARTERLY/", "99-system/AI_Governance/QUARTERLY/",
 )
 
 SEMANTIC_KEYWORDS = (
@@ -93,6 +97,17 @@ STOPWORK_FULL_REQUIRED = (
 
 ADR_CHAIN_MAX_DEPTH = 10
 DRAFT_EXPIRES_MAX_DAYS = 30
+
+# Phase 4 — lint mode selector.
+#   mode="hook" (default): all R1-R19 fire.
+#   mode="scan":           R1, R2, R8, R10, R17 skipped (write-time-only;
+#                          see lint() docstring for rationale).
+#                          R7 stays: legacy modifications are real violations.
+#                          R19 stays: lacks previous_frontmatter -> inert.
+# Skip logic lives in lint() body at each rule; the canonical list of skipped
+# rules is the per-rule `if not scan_mode:` guards there, not a separate table
+# (avoids two sources of truth drifting).
+VALID_LINT_MODES = frozenset({"hook", "scan"})
 
 ALLOWED_PATHS_MSG = {
     "executor": "executor allowed: projects/, decisions/ (forbidden: 00-Morgan/, archive/legacy_, 99-rules/, agents/)",
@@ -486,6 +501,7 @@ def _check_r19_status_upgrade(req: dict, fm: dict) -> Optional[str]:
 # ----------------------------------------------------------------------------
 
 def lint(req: dict, *, now: Optional[datetime] = None,
+         mode: str = "hook",
          adr_mutex_checker=_adr_mutex_check,
          r17_fingerprint_checker=_default_r17_fingerprint_checker) -> dict:
     """Run rules R1-R19 in order. First failure short-circuits.
@@ -498,7 +514,21 @@ def lint(req: dict, *, now: Optional[datetime] = None,
 
     R12 still returns a flag (preserved); R19 is the hard gate.
     R10 returns NEEDS_HUMAN on conflict; degrades to flag if gh unavailable.
+
+    Phase 4 — mode parameter:
+      mode="hook" (default): all rules R1-R19 fire (write-time gate).
+      mode="scan":           skip R1/R2/R8/R10/R17 — write-time-only concepts;
+                             R3-R7, R9, R11-R16, R18, R19 fire on file state.
+                             R19 lacks previous_frontmatter in scan -> inert.
     """
+    if mode not in VALID_LINT_MODES:
+        return _reject(
+            "PATH_PERMISSION",
+            f"unknown lint mode: {mode!r}; valid: {sorted(VALID_LINT_MODES)}",
+            "INPUT",
+        )
+    scan_mode = (mode == "scan")
+
     role = req.get("writer_role")
     engine = req.get("writer_engine")
     path = req.get("target_path")
@@ -508,21 +538,19 @@ def lint(req: dict, *, now: Optional[datetime] = None,
     vault_files = req.get("vault_files")
     previous_frontmatter = req.get("previous_frontmatter")
 
-    # R17 early: drift check runs before everything else. If the local rule
-    # source diverges from origin/main, downstream checks are based on stale
-    # rules and unsafe to trust. Skip gracefully when wrapper does not pass
-    # morgan_ai_rules_root (e.g. unit tests that mock).
-    r17_result = r17_fingerprint_checker(req)
-    if r17_result is not None:
-        msg, rule = r17_result
-        return _reject("CROSS_MACHINE_DRIFT_DETECTED", msg, rule)
+    # R17 — skip in scan mode. Drift check runs first in hook mode; if the
+    # local rule source diverges from origin/main, downstream checks are
+    # based on stale rules and unsafe to trust. Batch scan does not depend
+    # on a particular session's rule freshness, so the check is irrelevant.
+    if not scan_mode:
+        r17_result = r17_fingerprint_checker(req)
+        if r17_result is not None:
+            msg, rule = r17_result
+            return _reject("CROSS_MACHINE_DRIFT_DETECTED", msg, rule)
 
-    if role not in VALID_WRITER_ROLES:
-        return _reject(
-            "PATH_PERMISSION",
-            f"unknown writer_role: {role!r}; valid: {sorted(VALID_WRITER_ROLES)}",
-            "R1",
-        )
+    # R1 input validation. Path/op enum check applies in both modes;
+    # writer_role validation + path × role permission lookup is hook-only
+    # (vault paths do not map onto morgan-ai-rules writer_role tables).
     if not isinstance(path, str) or not path:
         return _reject("PATH_PERMISSION", "target_path missing or not a string", "R1")
     if op not in VALID_OPERATIONS:
@@ -531,13 +559,18 @@ def lint(req: dict, *, now: Optional[datetime] = None,
             f"unknown operation: {op!r}; valid: {sorted(VALID_OPERATIONS)}",
             "R1",
         )
+    if not scan_mode:
+        if role not in VALID_WRITER_ROLES:
+            return _reject(
+                "PATH_PERMISSION",
+                f"unknown writer_role: {role!r}; valid: {sorted(VALID_WRITER_ROLES)}",
+                "R1",
+            )
+        if not _path_allowed(path, role):
+            return _reject("PATH_PERMISSION", ALLOWED_PATHS_MSG.get(role, ""), "R1")
 
-    # R1
-    if not _path_allowed(path, role):
-        return _reject("PATH_PERMISSION", ALLOWED_PATHS_MSG.get(role, ""), "R1")
-
-    # R2
-    if engine == "codex" and role == "executor":
+    # R2 — skip in scan mode (no writer_engine concept in batch state sweep).
+    if not scan_mode and engine == "codex" and role == "executor":
         return _reject(
             "CODEX_EXECUTOR_FORBIDDEN",
             "use writer_engine 'claude', or change writer_role to advisor/auditor",
@@ -594,8 +627,10 @@ def lint(req: dict, *, now: Optional[datetime] = None,
             "R7",
         )
 
-    # R8
-    if _is_adr_path(path) and op == "update":
+    # R8 — skip in scan mode. operation=update is synthetic in batch scan,
+    # and "ADR changed since first written" cannot be detected from a single
+    # snapshot anyway. R8 is genuinely a write-time concept.
+    if not scan_mode and _is_adr_path(path) and op == "update":
         return _reject(
             "ADR_IMMUTABLE",
             "ADR is immutable; create a new ADR with frontmatter 'supersedes: <old_id>'",
@@ -608,9 +643,9 @@ def lint(req: dict, *, now: Optional[datetime] = None,
         if chain_err:
             return _reject("ADR_CHAIN_BROKEN", chain_err, "R9")
 
-    # R10 - NEEDS_HUMAN; flag if gh unavailable
+    # R10 — skip in scan mode (depends on active PR state via gh CLI).
     flags = []
-    if fm.get("supersedes"):
+    if not scan_mode and fm.get("supersedes"):
         other_pr, fallback = adr_mutex_checker(str(fm["supersedes"]))
         if other_pr is not None:
             return _needs_human(

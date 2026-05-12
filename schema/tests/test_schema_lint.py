@@ -1152,3 +1152,191 @@ class TestCeremonyHelpers:
         assert not sl._is_routine_workspace("agents/guardian.md")
         assert not sl._is_routine_workspace("decisions/ADR_x.md")
         assert not sl._is_routine_workspace("99-System/AI_Governance/DESIGN.md")
+
+    def test_is_routine_workspace_phase4_inbox_quarterly(self):
+        """Phase 4 — INBOX/ + QUARTERLY/ dual case (OneDrive cross-machine drift)."""
+        assert sl._is_routine_workspace("99-System/AI_Governance/INBOX/scan_2026-05-12.md")
+        assert sl._is_routine_workspace("99-system/AI_Governance/INBOX/scan_2026-05-12.md")
+        assert sl._is_routine_workspace("99-System/AI_Governance/QUARTERLY/audit_2026-Q2.md")
+        assert sl._is_routine_workspace("99-system/AI_Governance/QUARTERLY/audit_2026-Q2.md")
+        # README at root of INBOX/QUARTERLY still routine (prefix match)
+        assert sl._is_routine_workspace("99-System/AI_Governance/INBOX/README.md")
+
+
+# ----------------------------------------------------------------------------
+# Phase 4 — scan mode
+# ----------------------------------------------------------------------------
+
+class TestPhase4ScanMode:
+    """mode='scan' skips R1/R2/R8/R10/R17 (write-time-only); rest fires."""
+
+    # -- R1 skip --------------------------------------------------------------
+
+    def test_scan_skips_r1_writer_role_validation(self, valid_request):
+        """scan mode does not require writer_role to be valid."""
+        valid_request["writer_role"] = None  # invalid in hook mode
+        valid_request["target_path"] = "99-System/AI_Governance/DESIGN.md"
+        result = sl.lint(valid_request, mode="scan")
+        # Should not REJECT with R1 unknown role
+        assert not (result.get("fail_at_rule") == "R1"
+                    and "writer_role" in (result.get("suggested_fix") or ""))
+
+    def test_scan_skips_r1_path_role_check(self, valid_request):
+        """vault paths outside writer_role allow list pass in scan mode."""
+        # executor cannot write 00-Morgan/ in hook mode -> would REJECT R1
+        valid_request["target_path"] = "00-Morgan/private/notes.md"
+        valid_request["operation"] = "update"
+        result = sl.lint(valid_request, mode="scan")
+        assert result.get("fail_at_rule") != "R1"
+
+    def test_scan_keeps_path_input_validation(self, valid_request):
+        """path must still be a non-empty string in scan mode."""
+        valid_request["target_path"] = ""
+        result = sl.lint(valid_request, mode="scan")
+        assert result["verdict"] == "REJECT"
+        assert result["fail_at_rule"] == "R1"
+
+    def test_scan_keeps_op_enum_validation(self, valid_request):
+        """operation enum still validated in scan mode."""
+        valid_request["operation"] = "nuke"
+        result = sl.lint(valid_request, mode="scan")
+        assert result["verdict"] == "REJECT"
+        assert result["fail_at_rule"] == "R1"
+
+    # -- R2 skip --------------------------------------------------------------
+
+    def test_scan_skips_r2_codex_executor(self, valid_request):
+        """codex+executor allowed in scan (no engine concept in batch state)."""
+        valid_request["writer_engine"] = "codex"
+        valid_request["writer_role"] = "executor"
+        result = sl.lint(valid_request, mode="scan")
+        assert result.get("fail_at_rule") != "R2"
+
+    # -- R8 skip --------------------------------------------------------------
+
+    def test_scan_skips_r8_adr_update(self, valid_request, make_content,
+                                       valid_frontmatter_lines):
+        """ADR update not blocked in scan mode."""
+        fm = valid_frontmatter_lines + ["risk: contract"]
+        valid_request["target_path"] = "decisions/ADR_2026-01-01_existing.md"
+        valid_request["operation"] = "update"
+        valid_request["content"] = make_content(fm)
+        result = sl.lint(valid_request, mode="scan")
+        assert result.get("fail_at_rule") != "R8"
+
+    # -- R10 skip -------------------------------------------------------------
+
+    def test_scan_skips_r10_adr_mutex(self, valid_request, make_content,
+                                       valid_frontmatter_lines):
+        """R10 mutex check (gh CLI) not invoked in scan mode."""
+        called = {"n": 0}
+
+        def boom(_target):
+            called["n"] += 1
+            return None, None
+
+        fm = valid_frontmatter_lines + ["supersedes: ADR_2026-01-01_old"]
+        valid_request["target_path"] = "decisions/ADR_2026-05-12_new.md"
+        valid_request["operation"] = "create"
+        valid_request["content"] = make_content(fm)
+        sl.lint(valid_request, mode="scan", adr_mutex_checker=boom)
+        assert called["n"] == 0, "R10 should not invoke mutex checker in scan mode"
+
+    # -- R17 skip -------------------------------------------------------------
+
+    def test_scan_skips_r17_fingerprint_check(self, valid_request):
+        """R17 drift check not invoked in scan mode."""
+        called = {"n": 0}
+
+        def boom(_req):
+            called["n"] += 1
+            return None
+
+        sl.lint(valid_request, mode="scan", r17_fingerprint_checker=boom)
+        assert called["n"] == 0, "R17 should not invoke fingerprint checker in scan mode"
+
+    # -- Rules that still fire ------------------------------------------------
+
+    def test_scan_still_fires_r3_missing_frontmatter(self, valid_request):
+        valid_request["content"] = "no frontmatter at all"
+        result = sl.lint(valid_request, mode="scan")
+        assert result["verdict"] == "REJECT"
+        assert result["fail_at_rule"] == "R3"
+
+    def test_scan_still_fires_r6_bad_naming(self, valid_request):
+        valid_request["target_path"] = "21_Projects/foo/UNTITLED.md"
+        result = sl.lint(valid_request, mode="scan")
+        assert result["verdict"] == "REJECT"
+        assert result["fail_at_rule"] == "R6"
+
+    def test_scan_still_fires_r7_legacy_readonly(self, valid_request):
+        """R7 stays in scan: legacy region being modified is real violation."""
+        valid_request["target_path"] = "archive/legacy_pretest_2025-Q4/foo.md"
+        result = sl.lint(valid_request, mode="scan")
+        assert result["verdict"] == "REJECT"
+        assert result["fail_at_rule"] == "R7"
+
+    def test_scan_still_fires_r14_bad_timestamp(self, valid_request, make_content,
+                                                  valid_frontmatter_lines):
+        fm = valid_frontmatter_lines + ["expires_at: 2026-06-08"]
+        valid_request["content"] = make_content(
+            ["status: draft", "valid_from: 2026-05-10", "owner: morgan",
+             "project_id: pattern_trader", "expires_at: 2026-06-08"]
+        )
+        result = sl.lint(valid_request, mode="scan")
+        assert result["verdict"] == "REJECT"
+        # Either R11 (parse) or R14 (timestamp). Both legitimate.
+        assert result["fail_at_rule"] in ("R11", "R14")
+
+    def test_scan_still_fires_r15_unregistered_project(self, valid_request, make_content):
+        valid_request["content"] = make_content([
+            "status: current", "valid_from: 2026-05-10",
+            "owner: morgan", "project_id: bogus_project",
+        ])
+        result = sl.lint(valid_request, mode="scan")
+        assert result["verdict"] == "REJECT"
+        assert result["fail_at_rule"] == "R15"
+
+    def test_scan_still_fires_r18_unknown_filename_in_ceremony_loc(self, valid_request):
+        """Non-routine path + non-ceremony filename + status:current -> NEEDS_HUMAN."""
+        valid_request["target_path"] = "99-System/AI_Governance/NEW_DOC.md"
+        result = sl.lint(valid_request, mode="scan")
+        assert result["verdict"] == "NEEDS_HUMAN"
+        assert result["fail_at_rule"] == "R18"
+
+    def test_scan_inbox_path_passes_r18(self, valid_request):
+        """Patch 2: INBOX path is routine workspace -> R18 does NOT fire."""
+        valid_request["target_path"] = "99-system/AI_Governance/INBOX/scan_2026-05-12.md"
+        result = sl.lint(valid_request, mode="scan")
+        assert result["verdict"] == "PASS"
+
+    def test_scan_quarterly_path_passes_r18(self, valid_request):
+        """Patch 2: QUARTERLY path is routine workspace -> R18 does NOT fire."""
+        valid_request["target_path"] = "99-System/AI_Governance/QUARTERLY/audit_2026-Q2.md"
+        result = sl.lint(valid_request, mode="scan")
+        assert result["verdict"] == "PASS"
+
+    # -- R19 inert without previous_frontmatter -------------------------------
+
+    def test_scan_r19_inert_without_prev(self, valid_request):
+        """R19 needs previous_frontmatter; vault_scan never provides it."""
+        # Even with operation=update + status=current, no prev means R19 inert.
+        valid_request["operation"] = "update"
+        # No previous_frontmatter key at all
+        valid_request.pop("previous_frontmatter", None)
+        result = sl.lint(valid_request, mode="scan")
+        assert result.get("fail_at_rule") != "R19"
+
+    # -- mode arg surface -----------------------------------------------------
+
+    def test_default_mode_is_hook(self, valid_request):
+        """Omitting mode arg defaults to hook (back-compat)."""
+        r_default = sl.lint(valid_request)
+        r_hook = sl.lint(valid_request, mode="hook")
+        assert r_default == r_hook
+
+    def test_unknown_mode_rejected(self, valid_request):
+        result = sl.lint(valid_request, mode="bogus")
+        assert result["verdict"] == "REJECT"
+        assert "bogus" in (result.get("suggested_fix") or "")
+        assert result["fail_at_rule"] == "INPUT"

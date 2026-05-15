@@ -1,0 +1,365 @@
+#!/usr/bin/env bash
+# posttooluse_vault_revert.sh - Phase 5.5 PostToolUse vault enforcement
+#
+# Installed at: ~/.claude/hooks/posttooluse_vault_revert.sh
+# Trigger     : Claude Code PostToolUse for Write|Edit (matcher in settings.json)
+# Stdin       : Claude Code PostToolUse JSON event
+#                 { "tool_name": "Write"|"Edit", "tool_input": { "file_path": ... } }
+# Exit        : Always 0 — PostToolUse exit codes do not affect tool execution
+#               (tool already ran). We log + revert + force-touch ourselves.
+#
+# Why this exists
+#   Phase 5 副發現 + Phase 5.5 root cause：Claude Code's PreToolUse hook exit 2
+#   does NOT reliably block Edit/Write writes (Anthropic known issue, closed
+#   "not planned"). v2.2 §1 物理紀律 假設破洞。
+#   Phase 5.5 路線 A workaround: PostToolUse → schema_lint → if reject, git
+#   revert the file using an external --git-dir (.git not inside OneDrive
+#   sync path; per 2026-05-13 .git/conflict-flood lesson).
+#
+# Coexistence with Phase 2c v2 PreToolUse hook
+#   PreToolUse v2 (pretooluse_vault_check.sh): advisory — prints REJECT
+#   stderr so Claude model self-corrects, but does NOT physically block.
+#   PostToolUse v5.5 (this file): physical enforcement — reverts bad
+#   writes via git checkout / quarantine.
+#
+# Mitigations baked in
+#   - quarantine instead of rm for untracked forbidden writes (audit trail)
+#   - force-touch + hash log after revert (Step 2 OneDrive race mitigation #1)
+#   - git lock retry loop (5x 100ms) to dodge OneDrive sync agent race
+#   - fail-closed to "revert" when schema_lint not locatable or errors
+
+set -uo pipefail
+
+PAYLOAD=$(cat)
+
+# Auto-detect Vault root + morgan-ai-rules root + git tracking dir.
+# Installer can pre-set VAULT_ROOT / VAULT_TRACKING_GIT_DIR / MORGAN_AI_RULES_ROOT
+# via env to skip the search.
+VAULT_ROOT="${VAULT_ROOT:-}"
+if [[ -z "$VAULT_ROOT" ]]; then
+  for cand in "/d/OneDrive/VPS-Obsidian" "/e/OneDrive/VPS-Obsidian"; do
+    if [[ -d "$cand" ]]; then
+      VAULT_ROOT="$cand"
+      break
+    fi
+  done
+fi
+
+VAULT_TRACKING_GIT_DIR="${VAULT_TRACKING_GIT_DIR:-}"
+if [[ -z "$VAULT_TRACKING_GIT_DIR" ]]; then
+  for cand in "/d/vault-tracking/.git" "/e/vault-tracking/.git"; do
+    if [[ -d "$cand" ]]; then
+      VAULT_TRACKING_GIT_DIR="$cand"
+      break
+    fi
+  done
+fi
+
+MORGAN_AI_RULES_ROOT="${MORGAN_AI_RULES_ROOT:-}"
+if [[ -z "$MORGAN_AI_RULES_ROOT" ]]; then
+  for cand in \
+    "/d/workspace/morgan-ai-rules" "/e/workspace/morgan-ai-rules" \
+    "/c/workspace/morgan-ai-rules" "$HOME/morgan-ai-rules" \
+    "$HOME/workspace/morgan-ai-rules"; do
+    if [[ -d "$cand/.git" ]]; then
+      MORGAN_AI_RULES_ROOT="$cand"
+      break
+    fi
+  done
+fi
+
+QUARANTINE_DIR="${QUARANTINE_DIR:-${VAULT_TRACKING_GIT_DIR%/.git}/quarantine}"
+REVERT_LOG="${REVERT_LOG:-$HOME/.claude/logs/vault_governance_revert.jsonl}"
+
+# If vault or tracking dir missing, nothing we can do — log + exit 0.
+if [[ -z "$VAULT_ROOT" || ! -d "$VAULT_ROOT" ]]; then
+  exit 0
+fi
+if [[ -z "$VAULT_TRACKING_GIT_DIR" || ! -d "$VAULT_TRACKING_GIT_DIR" ]]; then
+  # Tracking not initialized — Phase 5.5 init_vault_tracking.sh not run yet.
+  # Fail-open (cannot revert without git), but log warning.
+  mkdir -p "$(dirname "$REVERT_LOG")" 2>/dev/null || true
+  printf '{"timestamp":"%s","verdict":"NO_TRACKING","note":"VAULT_TRACKING_GIT_DIR missing — run init_vault_tracking.sh"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$REVERT_LOG" 2>/dev/null || true
+  exit 0
+fi
+
+SCHEMA_LINT=""
+if [[ -n "$MORGAN_AI_RULES_ROOT" && -r "$MORGAN_AI_RULES_ROOT/scripts/schema_lint.py" ]]; then
+  SCHEMA_LINT="$MORGAN_AI_RULES_ROOT/scripts/schema_lint.py"
+fi
+
+export VAULT_ROOT VAULT_TRACKING_GIT_DIR MORGAN_AI_RULES_ROOT \
+       QUARANTINE_DIR REVERT_LOG SCHEMA_LINT
+
+python3 - "$PAYLOAD" <<'PY'
+import json, os, sys, subprocess, hashlib, pathlib, time
+from datetime import datetime, timezone
+
+# Phase 5.5 — PostToolUse vault revert
+# - Always exit 0 (PostToolUse cannot block; we revert ourselves)
+# - PASS  → git add + commit (governs ✓)
+# - REJECT / NEEDS_HUMAN → revert via checkout HEAD (tracked) or quarantine (untracked)
+# - Errors → fail-closed: treat as REJECT (revert)
+SCRIPT_VERSION = "phase5.5-v1"
+
+VAULT_ROOT             = pathlib.Path(os.environ["VAULT_ROOT"])
+VAULT_TRACKING_GIT_DIR = pathlib.Path(os.environ["VAULT_TRACKING_GIT_DIR"])
+QUARANTINE_DIR         = pathlib.Path(os.environ["QUARANTINE_DIR"])
+REVERT_LOG             = pathlib.Path(os.environ["REVERT_LOG"])
+SCHEMA_LINT            = os.environ.get("SCHEMA_LINT", "")
+MORGAN_AI_RULES_ROOT   = os.environ.get("MORGAN_AI_RULES_ROOT", "")
+
+
+def _log(record):
+    record["timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    record["script_version"] = SCRIPT_VERSION
+    try:
+        REVERT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(REVERT_LOG, "a", encoding="utf-8", newline="") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        print(f"[POST-REVERT] log write failed: {exc}", file=sys.stderr)
+
+
+def _git(*args, retries=5, sleep_s=0.1):
+    cmd = ["git",
+           f"--git-dir={VAULT_TRACKING_GIT_DIR}",
+           f"--work-tree={VAULT_ROOT}",
+           *args]
+    last_err = None
+    for _ in range(retries):
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        # OneDrive sync may hold index.lock briefly; retry on that signature.
+        if proc.returncode == 0:
+            return proc
+        if "index.lock" in (proc.stderr or "") or "Unable to create" in (proc.stderr or ""):
+            last_err = proc.stderr
+            time.sleep(sleep_s)
+            continue
+        return proc
+    print(f"[POST-REVERT] git lock retry exhausted: {last_err}", file=sys.stderr)
+    return proc
+
+
+def _sha256(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _force_touch(path):
+    """Step 2 mitigation #1: nudge OneDrive watcher to see the final state."""
+    try:
+        # open + read + close → file access metadata bumps without content change
+        with open(path, "rb") as f:
+            f.read(0)
+    except OSError:
+        pass
+
+
+try:
+    payload = json.loads(sys.argv[1])
+except Exception:
+    _log({"verdict": "BAD_PAYLOAD", "raw": sys.argv[1][:200]})
+    sys.exit(0)
+
+tool_name = payload.get("tool_name", "")
+tool_input = payload.get("tool_input", {}) or {}
+file_path_raw = tool_input.get("file_path", "") or ""
+
+if tool_name not in ("Write", "Edit"):
+    sys.exit(0)
+if not file_path_raw:
+    sys.exit(0)
+
+# Normalize path (Windows backslashes → forward slashes, lowercase prefix match)
+fp_norm = file_path_raw.replace("\\", "/")
+vault_norm = str(VAULT_ROOT).replace("\\", "/")
+
+# Vault scope check
+under_vault = (
+    fp_norm.lower().startswith(vault_norm.lower() + "/")
+    or fp_norm.lower() == vault_norm.lower()
+)
+if not under_vault:
+    sys.exit(0)
+
+# Relative path inside vault
+rel_path = fp_norm[len(vault_norm) + 1:] if fp_norm.lower() != vault_norm.lower() else ""
+if not rel_path:
+    sys.exit(0)
+
+# Determine operation: post-write the file exists; we treat update vs create
+# by checking the git index, not filesystem (filesystem always shows existence
+# post-write).
+status_proc = _git("status", "--porcelain", "--", rel_path)
+status_line = (status_proc.stdout or "").strip().split("\n")[0] if status_proc.returncode == 0 else ""
+
+# No diff vs HEAD → governance no-op (file might have been written then no
+# actual content change vs index, or hook fired on a read-write that ended
+# identical).
+if not status_line:
+    _log({
+        "verdict": "NO_DIFF",
+        "tool_name": tool_name,
+        "rel_path": rel_path,
+    })
+    sys.exit(0)
+
+# Determine schema_lint verdict (REJECT / NEEDS_HUMAN / PASS / ERROR)
+verdict = "ERROR"
+error_code = ""
+fail_at_rule = ""
+suggested_fix = ""
+
+if SCHEMA_LINT and pathlib.Path(SCHEMA_LINT).is_file():
+    # Build schema_lint request mirroring PreToolUse contract.
+    try:
+        content = pathlib.Path(file_path_raw).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        content = ""
+    operation = "update" if status_line[:2] not in ("??", "A ") else "create"
+    req = {
+        "writer_role": "executor",
+        "writer_engine": "claude",
+        "target_path": rel_path,
+        "operation": operation,
+        "content": content,
+        "branch": "main",
+    }
+    if MORGAN_AI_RULES_ROOT:
+        req["morgan_ai_rules_root"] = MORGAN_AI_RULES_ROOT
+    try:
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        proc = subprocess.run(
+            [sys.executable, SCHEMA_LINT],
+            input=json.dumps(req, ensure_ascii=False),
+            capture_output=True, text=True, timeout=10,
+            encoding="utf-8", env=env,
+        )
+        try:
+            v_obj = json.loads(proc.stdout)
+            verdict = v_obj.get("verdict", "ERROR")
+            error_code = v_obj.get("error_code", "")
+            fail_at_rule = v_obj.get("fail_at_rule", "")
+            suggested_fix = v_obj.get("suggested_fix") or v_obj.get("human_summary_zh", "")
+        except Exception:
+            verdict = "ERROR"
+            suggested_fix = f"schema_lint output unparseable: {proc.stdout[:200]}"
+    except subprocess.TimeoutExpired:
+        verdict = "ERROR"
+        suggested_fix = "schema_lint timeout (>10s)"
+    except Exception as exc:
+        verdict = "ERROR"
+        suggested_fix = f"schema_lint invocation error: {exc}"
+
+# Decide action.
+#   PASS                        → COMMIT
+#   REJECT / NEEDS_HUMAN / ERROR → REVERT (fail-closed)
+if verdict == "PASS":
+    action = "COMMIT"
+else:
+    action = "REVERT"
+
+# Execute.
+hash_before = _sha256(file_path_raw)
+result_note = ""
+
+if action == "REVERT":
+    untracked = status_line.startswith("??")
+    if untracked:
+        # Quarantine instead of rm — keeps audit trail.
+        try:
+            day_dir = QUARANTINE_DIR / datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            day_dir.mkdir(parents=True, exist_ok=True)
+            ts_label = datetime.now(timezone.utc).strftime("%H%M%SZ")
+            safe_name = rel_path.replace("/", "__")[:160]
+            q_path = day_dir / f"{ts_label}_{safe_name}"
+            pathlib.Path(file_path_raw).replace(q_path)
+            result_note = f"quarantined_to={q_path}"
+        except OSError as exc:
+            # Best effort: if quarantine fails, fall back to delete.
+            try:
+                pathlib.Path(file_path_raw).unlink()
+                result_note = f"quarantine_failed_deleted exc={exc}"
+            except OSError as exc2:
+                result_note = f"quarantine+delete_failed exc={exc} exc2={exc2}"
+    else:
+        # Tracked modification → checkout HEAD.
+        proc = _git("checkout", "HEAD", "--", rel_path)
+        if proc.returncode == 0:
+            result_note = "checked_out_HEAD"
+        else:
+            result_note = f"checkout_failed rc={proc.returncode} stderr={proc.stderr[:200]}"
+
+    # Step 2 mitigation #1: force-touch + log final hash so OneDrive watcher
+    # sees the corrected file unambiguously and we have audit fingerprint.
+    if pathlib.Path(file_path_raw).exists():
+        _force_touch(file_path_raw)
+    hash_after = _sha256(file_path_raw) if pathlib.Path(file_path_raw).exists() else ""
+
+    print(
+        f"[POST-REVERT] REVERT ({fail_at_rule or 'no_lint'}): "
+        f"{rel_path} {result_note}",
+        file=sys.stderr,
+    )
+    if suggested_fix:
+        print(f"[POST-REVERT] suggested_fix: {suggested_fix}", file=sys.stderr)
+
+    _log({
+        "verdict": verdict,
+        "action": action,
+        "tool_name": tool_name,
+        "rel_path": rel_path,
+        "fail_at_rule": fail_at_rule,
+        "error_code": error_code,
+        "suggested_fix": suggested_fix,
+        "status_line": status_line,
+        "untracked": untracked,
+        "hash_before": hash_before,
+        "hash_after": hash_after,
+        "result_note": result_note,
+    })
+
+else:  # COMMIT
+    add_proc = _git("add", "--", rel_path)
+    if add_proc.returncode != 0:
+        result_note = f"add_failed rc={add_proc.returncode}"
+        print(f"[POST-REVERT] add failed: {add_proc.stderr[:200]}", file=sys.stderr)
+    else:
+        commit_msg = f"post_tool: {tool_name} {rel_path}"
+        commit_proc = subprocess.run(
+            ["git",
+             f"--git-dir={VAULT_TRACKING_GIT_DIR}",
+             f"--work-tree={VAULT_ROOT}",
+             "-c", "user.name=ai-governance-hook",
+             "-c", "user.email=hook@local",
+             "commit", "-m", commit_msg],
+            capture_output=True, text=True,
+        )
+        if commit_proc.returncode == 0:
+            # Capture commit hash.
+            head_proc = _git("rev-parse", "--short", "HEAD")
+            commit_sha = (head_proc.stdout or "").strip()
+            result_note = f"committed={commit_sha}"
+        else:
+            result_note = f"commit_failed rc={commit_proc.returncode}"
+
+    hash_after = _sha256(file_path_raw)
+    _log({
+        "verdict": verdict,
+        "action": action,
+        "tool_name": tool_name,
+        "rel_path": rel_path,
+        "status_line": status_line,
+        "hash_before": hash_before,
+        "hash_after": hash_after,
+        "result_note": result_note,
+    })
+
+sys.exit(0)
+PY

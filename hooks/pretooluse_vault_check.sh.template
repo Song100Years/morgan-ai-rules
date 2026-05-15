@@ -241,12 +241,25 @@ if mode == "shadow" and not is_r17_drift:
     sys.exit(0)
 
 # Enforce path (or R17 in any mode).
+# Phase 5.5 caveat: Claude Code's PreToolUse hook exit 2 does NOT reliably
+# block Edit/Write writes (known Anthropic issue, closed "not planned").
+# We print explicit guidance so the Claude model (which DOES read stderr)
+# can self-correct. The Phase 5.5 PostToolUse hook is the physical
+# enforcement net that reverts via git checkout.
+PHASE_5_5_CAVEAT = (
+    "注意：Claude Code 對 Edit/Write 不可靠尊重 PreToolUse exit 2 (Anthropic known gap)。"
+    " 你（Claude）若已讀到本訊息，請主動放棄本次寫入。"
+    " 若仍寫入，Phase 5.5 PostToolUse hook 會自動 git revert。"
+)
+
 if verdict == "REJECT":
     print(f"[VAULT-CHECK] REJECT ({rule}): {fix}", file=sys.stderr)
+    print(f"[VAULT-CHECK] {PHASE_5_5_CAVEAT}", file=sys.stderr)
     sys.exit(2)
 if verdict == "NEEDS_HUMAN":
     print(f"[VAULT-CHECK] 需 Morgan in loop ({rule}): {fix}", file=sys.stderr)
     print("這次寫入屬於 ceremony 級操作，請先跟 Morgan 對齊後再執行。", file=sys.stderr)
+    print(f"[VAULT-CHECK] {PHASE_5_5_CAVEAT}", file=sys.stderr)
     sys.exit(2)
 print(f"[VAULT-CHECK] unknown verdict: {verdict}", file=sys.stderr)
 sys.exit(2)
